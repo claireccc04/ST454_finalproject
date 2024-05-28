@@ -1,0 +1,2318 @@
+---
+title: "Final Project"
+date: "WT 2024"
+output: 
+  pdf_document:
+    fig_width: 6 
+    fig_height: 4 
+---
+
+<br><br>
+
+## Nimble/Stan dataset
+
+### 1. Introduction
+
+This project aims to address the question of which factors impact the expenditure patterns of British households. Furthermore, it seeks to examine whether disparities exist in household expenditure across various regions, and if so, how regional factors influence the expenditure. To answer these questions, I trained Bayesian non-hierarchical models and Bayesian hierarchical models both with nimble and stan. After conducting feature selection and comparing model performance, it is concluded that the Bayesian non-hierarchical model trained with Stan, utilizing variables `A172`, `A094r`, `A121r`, and `income`, offers the most optimal solution for this case.
+
+I utilized the 2013 Living Costs and Food Survey's educational dataset, where expenditure served as the outcome, and I incorporated 12 government office regions as random effects within the Bayesian hierarchical model. During data preprocessing, I logged both income and expenditure, and removed observations with a log(income) less than 2.5. Additionally, I excluded duplicated or irrelevant variables from the analysis, such as `weighta`, `P550tpr`, and `P344pr`. Unlike the prior project, I examined all variables and made feature selection based on "significance". 
+
+
+
+
+```{r setup, include=FALSE} 
+# this chunk contains code that sets global options for the entire .Rmd. 
+# we use include=FALSE to suppress it from the top of the document, but it will still appear in the appendix. 
+
+knitr::opts_chunk$set(echo = FALSE) # actually set the global chunk options. 
+# we set echo=FALSE to suppress code such that it by default does not appear throughout the document. 
+# note: this is different from .Rmd default
+```
+
+
+```{r echo=FALSE, message=FALSE}
+library(ggplot2)
+library(png)
+library(tidyverse)
+library(gridExtra)
+library(arm)
+library(nimble)
+library(rstan)
+library(rstanarm)
+library(coda)
+library(bayesplot)
+library(loo)
+theme_set(theme_bw())
+```
+
+
+```{r}
+#read the data
+livingexp.dat<-read.csv("7932_F1.csv",header = TRUE, stringsAsFactors = TRUE)
+
+#remove the replicate variables
+livingexp.dat <- livingexp.dat[, !colnames(livingexp.dat) %in% c("P550tpr", "P344pr", "casenew", "weighta")]
+
+#turn the categorical variables into factors
+categorical_cols <- !colnames(livingexp.dat) %in% c("income", "expenditure")
+categorical_cols <- colnames(livingexp.dat)[categorical_cols]
+livingexp.dat[categorical_cols] <- lapply(livingexp.dat[,categorical_cols], factor)
+
+#preprocess the data
+livingexp.dat <- livingexp.dat %>%
+  mutate(income=ifelse(income==0,0.5,income))%>%
+  mutate(expenditure=log(expenditure)) %>%
+  mutate(income=log(income)) 
+
+#remove samples with income less than 2.5
+livingexp.dat <- livingexp.dat %>% filter(income>2.5)
+```
+
+
+<br><br>
+
+### 2. Summary of EDA
+
+Region 8 has the highest income and expenditure while region 1 has the lowest. There are substantial discrepancies of expenditure across regions, which may impact the performance of non-hierarchical models. Notably, the distributiuon of both expenditure and income are skewed, with large samples clustered between 6 and 7. Thus, the prior distribution should be changed to compare model performance when training the model.
+
+```{r eval = FALSE}
+avg_dat <- livingexp.dat %>%
+  group_by(Gorx) %>%
+  summarise(avg_income = mean(income),
+            avg_exp = mean(expenditure)) 
+
+#plot1: Log Average Expenditure/Income across Region
+ggplot(avg_dat, aes(x=avg_income, y=avg_exp, color=as.factor(Gorx))) +
+  geom_point() +
+  geom_text(aes(label = Gorx), vjust = -0.5) +
+  labs(x="Log Average Income", y="Log Average Expenditure", title="Log Average Expenditure/Income across Region") +
+  scale_color_discrete() + 
+  theme_minimal()
+```
+
+
+```{r}
+#plot for expenditure
+expenditure_plot <- ggplot(data = livingexp.dat, aes(x = expenditure)) +
+  geom_histogram(fill = "skyblue", color = "black", bins = 30) +  
+  labs(title = "Distribution of Log(Expenditure)",
+       x = "Expenditure",
+       y = "Frequency")
+
+#plot for income
+income_plot <- ggplot(data = livingexp.dat, aes(x = income)) +
+  geom_histogram(fill = "lightgreen", color = "black", bins = 30) +  
+  labs(title = "Distribution of Log(Income)",
+       x = "Income",
+       y = "Frequency")
+
+grid.arrange(expenditure_plot,income_plot,nrow=1)
+```
+
+
+
+When visualizing the distribution of predictors and regions, it becomes evident that the influence of region on expenditure primarily affects the intercepts rather than the slopes. Hence, in Bayesian hierarchical models, the model featuring random effects only at the intercept may yield superior performance.
+
+```{r}
+livingexp.dat %>%
+  ggplot(aes(x = income, y = expenditure, color = factor(Gorx))) +
+  geom_point() +
+  geom_smooth(method = 'lm', se = F) +
+  facet_wrap(~factor(Gorx))
+```
+
+
+
+<br><br>
+
+### 3. Analysis of non-hierarchical models
+
+**Frenquentist model**: First, I fit the model in a frequentist regression approach. Only `A172`, `A094r`, `A121r`, and `A049r` variables are important with p values less than 0.05. This model explains 41.78% of the variance in expenditure. 
+
+```{r eval = FALSE}
+#frequentist regression
+fre_model <- lm(expenditure ~ ., data = livingexp.dat)
+
+summary(fre_model)
+```
+
+**Non-hierarchical model with nimble**: First, I screened variables based on a significance level of 95%, resulting in 6 variables: `A172`, `A094r`, `A121r`, `G018r`, `G019r`, and `income`. They measure the internet connection status in the household, occupation category of the household reference person, residential status, number of adults in the household, number of children in the household, and household income. 
+
+Retraining Bayesian non-hierarchical model on these variables, I found that the mixing of `Intercept`, `A121r3`, and `Income` had the worst effect. Furthermore, their elevated rhat values and diminished neff values suggest significant chain variances and inadequate convergence. The covergence of these preditctors also affected the intercept, which acted as a dummy for the baseline level.
+
+
+```{r}
+#prepare the data
+X <- livingexp.dat[, !colnames(livingexp.dat) %in% c("Gorx")]
+X <- model.matrix(expenditure~., data = X)
+```
+
+
+```{r eval = FALSE}
+exp_nim_code <- nimbleCode({
+#priors
+  #regression coefficients
+for (d in 1:D) {
+  beta[d] ~dnorm(0,0.0001)
+}
+  #precision
+  tau ~ dgamma(2.5,0.5)
+  sigma <- sqrt(1/tau)
+
+#likelihood
+  for (i in 1:N){
+    mu[i] <- inprod(beta[1:D], X[i,1:D])
+    expenditure[i] ~ dnorm(mu[i], tau)
+  }
+})
+
+nh_nimble_constants <- list(N = nrow(X), X=X, D=ncol(X)) #model matrix
+nh_nimble_data <- list(expenditure = livingexp.dat$expenditure)
+nh_nimble_inits <- list(beta=rep(0,ncol(X)), tau=0.1)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_nim_model<- nimbleModel(code = exp_nim_code, #model
+                            name = "exp_nimble_model", #name
+                            constants = nh_nimble_constants, #constants
+                            data = nh_nimble_data, # data
+                            inits = nh_nimble_inits #inits
+                            )
+
+exp_nim_compile<-compileNimble(exp_nim_model)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+nh_nimble_inits <- list(list(beta=rep(0,ncol(X)), tau=0.1), list(beta=rep(1,ncol(X)), tau=1))
+m <- 5000
+bi <-4000
+exp_nim_mcmc <- nimbleMCMC(code=exp_nim_model,
+                           constants=nh_nimble_const,
+                           data=nh_nimble_data, 
+                           inits=nh_nimble_inits,
+                           nchains=2, 
+                           niter=m, 
+                           summary=TRUE,
+                           nburnin = bi,
+                           monitors=c('beta', 'tau', 'sigma'),
+                           samplesAsCodaMCMC = TRUE)
+```
+
+
+```{r eval = FALSE}
+#turn the row name of coefficients to variable names
+X_colnames <- colnames(X)
+exp_nim_mcmc_samples <- MCMCvis::MCMCsummary(exp_nim_mcmc$samples)
+
+rownames(exp_nim_mcmc_samples)[1:28] <- X_colnames
+exp_nim_mcmc_samples
+```
+
+```{r}
+selected_features_nimble <- c("(Intercept)","A1722","A094r2","A094r3","A094r4","A094r5","A121r2","A121r3",
+                       "G018r2","G019r3","income")
+
+X <- X[,selected_features_nimble]
+```
+
+
+
+```{r eval = FALSE}
+exp_nim_code <- nimbleCode({
+#priors
+  #regression coefficients
+for (d in 1:D) {
+  beta[d] ~dnorm(0,0.0001)
+}
+  #precision
+  tau ~ dgamma(2.5,0.5)
+  sigma <- sqrt(1/tau)
+
+#likelihood
+  for (i in 1:N){
+    mu[i] <- inprod(beta[1:D], X[i,1:D])
+    expenditure[i] ~ dnorm(mu[i], tau)
+  }
+})
+
+nh_nimble_constants <- list(N = nrow(X), X=X, D=ncol(X)) #model matrix
+nh_nimble_data <- list(expenditure = livingexp.dat$expenditure)
+nh_nimble_inits <- list(beta=rep(0,ncol(X)), tau=0.1)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_nim_model<- nimbleModel(code = exp_nim_code, #model
+                            name = "exp_nimble_model", #name
+                            constants = nh_nimble_constants, #constants
+                            data = nh_nimble_data, # data
+                            inits = nh_nimble_inits #inits
+                            )
+
+exp_nim_compile<-compileNimble(exp_nim_model)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+nh_nimble_inits <- list(list(beta=rep(0,ncol(X)), tau=0.1), list(beta=rep(1,ncol(X)), tau=1))
+m <- 5000
+bi <-4000
+exp_nim_mcmc <- nimbleMCMC(code=exp_nim_model,
+                           constants=nh_nimble_const,
+                           data=nh_nimble_data, 
+                           inits=nh_nimble_inits,
+                           nchains=2, 
+                           niter=m, 
+                           summary=TRUE,
+                           nburnin = bi,
+                           monitors=c('beta', 'tau', 'sigma'),
+                           samplesAsCodaMCMC = TRUE,
+                           WAIC = TRUE)
+```
+
+
+```{r eval = FALSE}
+#turn the row name of coefficients to variable names
+X_colnames <- colnames(X)
+exp_nim_mcmc_samples <- MCMCvis::MCMCsummary(exp_nim_mcmc$samples)
+
+rownames(exp_nim_mcmc_samples)[1:11] <- X_colnames
+exp_nim_mcmc_samples
+```
+
+
+
+
+```{r eval = FALSE, message = FALSE, warning = FALSE}
+p1_nimbel <- bayesplot::mcmc_trace(exp_nim_mcmc$samples,
+                      facet_args = list(ncol = 2, strip.position = "left"))
+
+ggsave("plot/p1_nimbel.png", p1_nimbel)
+```
+
+
+
+```{r}
+#for knitting
+p1_nimbel <- readPNG("plot/p1_nimbel.png")
+
+plot(1:2, type='n', xlab='', ylab='', axes=F)
+rasterImage(p1_nimbel, 1, 1, 2, 2)
+```
+
+
+
+```{r eval = FALSE}
+exp_nim_mcmc$WAIC
+```
+
+```{r eval = FALSE}
+exp_nim_t_code <- nimbleCode({
+#priors
+  #regression coefficients
+for (d in 1:D) {
+  beta[d] ~ dnorm(0,0.0001)
+}
+  #precision
+  tau ~ dgamma(2.5,0.5)
+  sigma <- sqrt(1/tau)
+
+#likelihood
+  for (i in 1:N){
+    mu[i] <- inprod(beta[1:D], X[i,1:D])
+    expenditure[i] ~ dlnorm(mu[i], tau)
+  }
+})
+
+nh_nimble_constants <- list(N = nrow(X), X=X, D=ncol(X)) #model matrix
+nh_nimble_data <- list(expenditure = livingexp.dat$expenditure)
+nh_nimble_inits <- list(beta=rep(0,ncol(X)), tau=0.1)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_nim_t_model<- nimbleModel(code = exp_nim_t_code, #model
+                            name = "exp_nimble_t_model", #name
+                            constants = nh_nimble_constants, #constants
+                            data = nh_nimble_data, # data
+                            inits = nh_nimble_inits #inits
+                            )
+
+exp_nim_t_compile<-compileNimble(exp_nim_t_model)
+```
+
+
+```{r eval = FALSE, message = FALSE, warning = FALSE, results = 'hide'}
+nh_nimble_inits <- list(list(beta=rep(0,ncol(X)), tau=0.1), list(beta=rep(1,ncol(X)), tau=1))
+m <- 5000
+bi <-4000
+exp_nim_t_mcmc <- nimbleMCMC(code=exp_nim_t_model,
+                           constants=nh_nimble_const,
+                           data=nh_nimble_data, 
+                           inits=nh_nimble_inits,
+                           nchains=2, 
+                           niter=m, 
+                           summary=TRUE,
+                           nburnin = bi,
+                           monitors=c('beta', 'tau', 'sigma'),
+                           samplesAsCodaMCMC = TRUE,
+                           WAIC = TRUE)
+```
+
+Given that the distribution of `expenditure` is skewed, with a significant concentration of samples around 7, I tried to change the outcome distribution to a lognormal distribution with heavier tails. However, the convergence of `income` and `A121r3` didn't improve.
+
+```{r eval = FALSE, message = FALSE, warning = FALSE}
+bayesplot::mcmc_trace(exp_nim_t_mcmc$samples,
+                      facet_args = list(ncol = 2, strip.position = "left"))
+```
+
+
+
+
+
+
+<br>
+
+**Non-hierarchical model with stan**: I also conducted variable screening for the Stan model, yielding similar variables to Nimble. With the exception of `G018r` and `G019r`, all other variables were retained, resulting in a total of 4 variables. In comparison to Nimble, the Bayesian non-hierarchical model trained by Stan exhibited significantly better convergence performance. The rhat values of all coefficients ranged between 1 and 1.01, indicating good convergence, and the neff values were larger generally. The acf plots show that the autocorrelation went away quite quickly within 3/4 lags, suggesting that the chains converge well within the current iterations. Notably, both `Income` and `A121r3`, which exhibited poor mixing effects in Nimble, appeared to have stationary distributions of both chains as shown in traceplots of beta[9] and beta[8]. And thus, the convergence performance of the `Intercept` was also enhanced. Regarding the model fitting, I computed the WAIC value of 6028.3, which could be used for the comparison later.
+
+
+```{r}
+#prepare the data
+X <- livingexp.dat[, !colnames(livingexp.dat) %in% c("Gorx")]
+X <- model.matrix(expenditure~., data = X)
+
+nh_stan_data <- list(expenditure = livingexp.dat$expenditure, X=X, N=nrow(X), D=ncol(X))
+nh_stan_inits <- list(list(beta=rep(0, ncol(X)), sigma=1),list(beta=rep(10,ncol(X),sigma=10)))
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+write("// Stan model for linear regression
+data {
+int<lower=0> N; //number of data items
+int<lower=0> D; // number of predictors
+matrix[N, D] X; // predictor matrix
+array[N] real expenditure; // outcome vector as an array
+}
+parameters {
+vector[D] beta; // coefficients for predictors
+real<lower=0> sigma; // SD of mean
+}
+
+model {
+expenditure ~ normal(X * beta, sigma); // likelihood
+beta ~ normal(0, 2.5); //priors
+sigma ~ cauchy(0, 5);
+}" ,
+"stan_models/exp.stan")
+stanc("stan_models/exp.stan")
+exp_stan_model <- stan_model("stan_models/exp.stan",
+                             model_name="exp_stan")
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_stan_fit <- sampling(exp_stan_model,
+                         data = nh_stan_data,
+                         warmup = 4000,
+                         iter = 5000,
+                         chains = 2,
+                         thin = 2,
+                         init = nh_stan_inits)
+```
+
+
+```{r}
+#select the important features
+selected_features_stan <- c("(Intercept)","A1722","A094r2","A094r3","A094r4","A094r5","A121r2","A121r3","income")
+X <- X[,selected_features_stan]
+
+nh_stan_data <- list(expenditure = livingexp.dat$expenditure, X=X, N=nrow(X), D=ncol(X))
+nh_stan_inits <- list(list(beta=rep(0, ncol(X)), sigma=1),list(beta=rep(10,ncol(X),sigma=10)))
+```
+
+
+```{r message = FALSE, results = 'hide', eval = FALSE}
+write("// Stan model for linear regression
+data {
+int<lower=0> N; //number of data items
+int<lower=0> D; // number of predictors
+matrix[N, D] X; // predictor matrix
+array[N] real expenditure; // outcome vector as an array
+}
+parameters {
+vector[D] beta; // coefficients for predictors
+real<lower=0> sigma; // SD of mean
+}
+
+model {
+expenditure ~ normal(X * beta, sigma); // likelihood
+beta ~ normal(0, 2.5); //priors
+sigma ~ cauchy(0, 5);
+}
+generated quantities { //for use with the loo package
+  vector[N] expenditure_rep;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    expenditure_rep[n] = normal_rng(dot_product(X[n], beta), sigma);
+    log_lik[n] = normal_lpdf(expenditure[n] | dot_product(X[n], beta), sigma);
+  }
+}" 
+,
+"stan_models/exp.stan")
+stanc("stan_models/exp.stan")
+exp_stan_model <- stan_model("stan_models/exp.stan",
+                             model_name="exp_stan")
+```
+
+
+```{r message = FALSE, results = 'hide', eval = FALSE}
+exp_stan_fit <- sampling(exp_stan_model,
+                         data = nh_stan_data,
+                         warmup = 4000,
+                         iter = 5000,
+                         chains = 2,
+                         thin = 2,
+                         init = nh_stan_inits)
+```
+```{r eval = FALSE}
+log_lik_stan <- extract_log_lik(exp_stan_fit, merge_chains = FALSE)
+waic_stan <- waic(log_lik_stan)
+```
+
+
+```{r message = FALSE, warning = FALSE, eval = FALSE}
+bayesplot::mcmc_trace(exp_stan_fit,
+                      facet_args = list(ncol = 2, strip.position = "left"))
+#autocorrelation functions
+bayesplot::mcmc_acf(exp_stan_fit)
+```
+
+
+
+
+
+
+
+```{r message = FALSE, eval = FALSE}
+#plot the posterior
+expenditure_rep <- as.matrix(exp_stan_fit, pars="expenditure_rep")
+
+ppc_dens_overlay(livingexp.dat$expenditure,expenditure_rep)
+```
+
+```{r eval = FALSE}
+ppc_dens_overlay_grouped(livingexp.dat$expenditure,
+                         expenditure_rep,
+                         group = livingexp.dat$Gorx)
+```
+
+```{r eval = FALSE}
+coeffcient_stan <- as.data.frame(summary(exp_stan_fit, pars=c("sigma",paste("beta[",1:9,"]",sep = "")),
+                                         probs=c(0.025, 0.975))$summary)
+
+rownames(coeffcient_stan) <- c("sigma", "(Intercept)","A1722","A094r2","A094r3","A094r4","A094r5","A121r2","A121r3","income")
+```
+
+
+```{r eval = FALSE}
+coeffcient_stan
+```
+
+
+
+
+<br><br>
+
+### 4. Analysis of hierarchical models
+
+**Hierarichical models in Nimble**: The model trained with independent random effects on all coefficients in nimble, including intercepts and slopes, exhibits poor predictive power. Moreover, when comparing WAIC values between this model and the Bayesian non-hierarchical model trained by Nimble, the former yields a higher WAIC value of 57731.96 compared to 5925.279 for the latter. These results suggest a bad fitting effect of the fully hierarichical model. 
+
+Then I tried to run a hierarichical model with random effect only on intercept. It achieved a WAIC value of 45771.92, slightly better than the fully hierarichical model. However, the acf plot shows that the chain was not moving around enough and it didn't converge well.
+
+```{r eval = FALSE}
+#fully hierarchical for all coefficients
+exp_rsri_nim_code <- nimbleCode({
+  #priors for regression coefficients
+  for (d in 1:D) {
+    mu_beta[d] ~ dnorm(0, sd = 100)
+    sigma_beta[d] ~ T(dt(0, 0.16, 1),0,) # should follow Cauchy(0,2.5) approx
+    
+    for (j in 1:J) {
+      beta[j,d] ~ dnorm(mu_beta[d], sigma_beta[d])
+    }
+  }
+  
+  #priors for residual variance
+  sigma ~ T(dt(0, 0.16, 1),0,) # should follow Cauchy(0,2.5) approx
+  
+  # Likelihood
+  for (i in 1:N) {
+     mu[i] <- inprod(beta[gorx[i],1:D], X[i,1:D])
+     expenditure[i] ~ dnorm(mu[i], sigma)
+  }
+  
+  #prediction
+  for (i in 1:N) {
+    expenditure_rep[i] ~ dnorm(inprod(beta[gorx[i],1:D], X[i,1:D]),sd=sigma)
+  }
+})
+```
+
+
+```{r eval = FALSE}
+selected_features_nimble <- c("A172","A094r","A121r","G018r","G019r","income")
+livingexp.dat <- livingexp.dat[,c("expenditure", "Gorx", selected_features_nimble)]
+livingexp.dat$Gorx <- as.numeric(livingexp.dat$Gorx)
+X <- model.matrix(expenditure~.-Gorx,data = livingexp.dat)
+J <- as.numeric(length(unique(livingexp.dat$Gorx))) #number of regions
+nimble_constants <- list(N = nrow(X), X=X, D=ncol(X), J=J, gorx=livingexp.dat$Gorx)
+nimble_data <- list(expenditure = livingexp.dat$expenditure)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_rsri_nim_model<- nimbleModel(code = exp_rsri_nim_code, #model
+                            name = "exp_rsri_nimble_demo", #name
+                            constants =nimble_constants, #constants
+                            data = nimble_data, # data
+                            )
+
+#only monitor the prediction
+exp_rsri_nim_mcmc <- buildMCMC(exp_rsri_nim_model, monitors = c("expenditure_rep"))
+#compile the model
+exp_rsri_nim_C <- compileNimble(exp_rsri_nim_model)
+exp_rsri_nim_Cmcmc <- compileNimble(exp_rsri_nim_mcmc,
+                              project = exp_rsri_nim_model)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_rsri_nim_inits <- list(list(sigma=1))
+
+#get the same result
+set.seed(1234) 
+
+exp_rsri_nim_samples <- runMCMC(exp_rsri_nim_Cmcmc,
+                                inits = exp_rsri_nim_inits,
+                                nchains=1,
+                                niter=5000,
+                                nburnin = 4500) 
+```
+
+
+
+```{r eval = FALSE, message = FALSE, warning = FALSE}
+expenditure_rep_nimble <- exp_rsri_nim_samples
+
+ppc_dens_overlay(livingexp.dat$expenditure, expenditure_rep_nimble)
+```
+
+```{r eval = FALSE}
+#monitor WAIC
+exp_rsri_nim_mcmc <- buildMCMC(exp_rsri_nim_model, enableWAIC=TRUE)
+#compile the model
+exp_rsri_nim_C <- compileNimble(exp_rsri_nim_model)
+exp_rsri_nim_Cmcmc <- compileNimble(exp_rsri_nim_mcmc,
+                              project = exp_rsri_nim_model)
+
+exp_rsri_nim_inits <- list(list(sigma=1), list(sigma=0.5))
+
+#get the same result
+set.seed(1234) 
+
+exp_rsri_nim_samples <- runMCMC(exp_rsri_nim_Cmcmc,
+                                inits = exp_rsri_nim_inits,
+                                nchains=2,
+                                niter=5000,
+                                nburnin = 4500,
+                                WAIC = TRUE) 
+```
+
+```{r eval = FALSE}
+exp_rsri_nim_samples$WAIC
+```
+```{r eval = FALSE}
+#hierarchical model with random effect only on intercept
+exp_ri_nim_code <- nimbleCode({
+  
+  #priors for regression coefficients
+  for (d in 1:D) {
+    mu_beta[d] ~ dnorm(0, sd = 100)
+    sigma_beta[d] ~ T(dt(0, 0.16, 1), 0,) # should follow Cauchy(0,2.5) approx
+    
+    #fixed effects
+    beta[d] ~ dnorm(mu_beta[d], sigma_beta[d])
+  }
+    
+    #priors for residual variance
+    sigma ~ T(dt(0, 0.16, 1), 0,) # should follow Cauchy(0,2.5) approx
+    
+    #random effect for intercept 
+    for (j in 1:J) {
+      mu_a[j] ~ dnorm(0, sd = 100)
+      sigma_a[j] ~ T(dt(0, 0.16, 1), 0,) # should follow Cauchy(0,2.5) approx
+      nu[j] ~ dnorm(mu_a[j], sigma_a[j])
+  }
+  
+    # Likelihood
+    for (i in 1:N) {
+      mu[i] <- inprod(beta[1:D], X[i,1:D]) + nu[gorx[i]]  
+      expenditure[i] ~ dnorm(mu[i], sigma)
+  }
+    
+  #prediction
+  for (i in 1:N) {
+    expenditure_rep[i] ~ dnorm(inprod(beta[1:D], X[i,1:D]) + nu[gorx[i]], sd=sigma) 
+  }
+  
+  
+})
+```
+
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_ri_nim_inits <- list(list(sigma=1))
+
+exp_ri_nim_model<- nimbleModel(code = exp_ri_nim_code, #model
+                            name = "exp_ri_nimble_demo", #name
+                            constants =nimble_constants, #constants
+                            data = nimble_data,# data
+                            inits = exp_ri_nim_inits
+                            )
+
+exp_ri_nim_compile <- compileNimble(exp_ri_nim_model)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_ri_nim_inits <- list(list(sigma=1), list(sigma=0.5))
+
+#get the same result
+set.seed(1234) 
+
+exp_ri_nim_samples <- nimbleMCMC(code = exp_ri_nim_model,
+                                 constants = nimble_constants,
+                                 data = nimble_data,
+                                 inits = exp_ri_nim_inits,
+                                 nchains=2,
+                                 niter=5000,
+                                 nburnin = 4000,
+                                 summary = TRUE,
+                                 monitors = c("beta","nu","sigma"),
+                                 thin = 2,
+                                 samplesAsCodaMCMC = TRUE) 
+```
+```{r eval = FALSE}
+bayesplot::mcmc_trace(exp_ri_nim_samples$sample, 
+                      pars = c("beta[1]","beta[2]","beta[3]","beta[4]","beta[5]","beta[6]","beta[7]",
+                               "beta[8]","beta[9]","beta[10]","beta[11]","beta[12]","beta[13]","beta[14]"), 
+                      facet_args = list(ncol = 2, strip.position = "left"))
+bayesplot::mcmc_acf(exp_ri_nim_samples$samples,
+                    pars = c("beta[1]","beta[2]","beta[3]","beta[4]","beta[5]","beta[6]","beta[7]",
+                               "beta[8]","beta[9]","beta[10]","beta[11]","beta[12]","beta[13]","beta[14]"))
+```
+
+
+
+```{r eval = FALSE}
+exp_ri_nim_samples$WAIC
+```
+
+
+```{r eval = FALSE, message = FALSE, warning = FALSE}
+expenditure_rep_nimble_ri <- exp_ri_nim_samples
+
+ppc_dens_overlay(livingexp.dat$expenditure, expenditure_rep_nimble_ri)
+```
+
+
+<br>
+
+
+
+**Hierarichical models in Stan**: Given that the random effects of region primarily exert on the intercept, I trained 2 hierarchical models with selected features by using stan: **random intercept + fixed slope**, and **random slope of continuous predictor and fixed slope of categorical predictors**. In the hierarchical model with random intercept, the negative random effects observed for regions 1-5, 7, and 10 suggest that households located in these regions tend to have lower expenditures compared to households in other regions, all else being equal. Notably, region 12 exhibits the largest absolute random effect, at 0.07, indicating that households residing in this region are estimated to spend approximately 7.25% more than identical households without region-specific information. In general, there is little difference among the random effects across regions in both models, indicating that the regional information is limited.
+
+Compared to the models in nimble, they both converged much better, converging after approximately 4600 iterations. They performed comparable in terms of fitting, with WAIC values around 6004. In terms of prediction, both the non-hierarchical and hierarchical models in Stan demonstrate similar performance as shown below. However, they fail to accurately predict the turning points, particularly around the expenditure value of 7. Notably, the small double peaks observed in regions 1, 3, and 11 are not captured effectively in the predicted posterior distribution. 
+
+```{r message = FALSE, eval = FALSE}
+#plot the posterior
+expenditure_rep <- as.matrix(exp_stan_fit, pars="expenditure_rep")
+
+p3_stan <- ppc_dens_overlay(livingexp.dat$expenditure,expenditure_rep)
+```
+
+```{r eval = FALSE}
+ggsave("plot/p3_stan.png", p3_stan)
+```
+
+
+```{r}
+p3_stan <- readPNG("plot/p3_stan.png")
+
+plot(1:2, type='n', xlab='', ylab='', axes=F)
+rasterImage(p3_stan, 1, 1, 2, 2)
+```
+
+
+```{r eval = FALSE}
+p4_stan <- ppc_dens_overlay_grouped(livingexp.dat$expenditure,
+                         expenditure_rep,
+                         group = livingexp.dat$Gorx)
+```
+
+
+```{r eval = FALSE}
+ggsave("plot/p4_stan.png", p4_stan)
+```
+
+
+```{r}
+p4_stan <- readPNG("plot/p4_stan.png")
+
+plot(1:2, type='n', xlab='', ylab='', axes=F)
+rasterImage(p4_stan, 1, 1, 2, 2)
+```
+
+
+
+
+
+
+
+```{r}
+selected_features_stan <- c("A172","A094r","A121r","income")
+livingexp.dat <- livingexp.dat[,c("expenditure", "Gorx", selected_features_stan)]
+livingexp.dat$Gorx <- as.numeric(livingexp.dat$Gorx)
+J <- as.numeric(length(unique(livingexp.dat$Gorx)))
+X <- model.matrix(expenditure~.-Gorx,data = livingexp.dat)
+D <- ncol(X)
+N <- nrow(X)
+```
+
+
+```{r eval = FALSE}
+exp_rsri_stan_data<-list(expenditure = livingexp.dat$expenditure,
+                         gorx = livingexp.dat$Gorx,
+                         X=X,
+                         N = nrow(X),
+                         J = J,
+                         D = ncol(X))
+
+exp_inits <- list(list(sigma_res=1,sigma_beta=c(1,2,3,4)),
+                  list(sigma_res=10,sigma_beta=c(1,2,3,4)))
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+#fully hierarchical 
+write("//stan model: linear hierarchical regression
+data {
+  int<lower=1> D; // number of predictors + intercept
+  int<lower=0> N; // number of data
+  int<lower=1> J; // number of regions
+  array[N] real expenditure; // outcome
+  array[N] int<lower=1, upper=J> gorx; // the class number
+  array[N] row_vector[D] X; // the design matrix
+}
+parameters {
+  array[D] real mu_beta; // the mean for predictors+intercept
+  array[J] vector[D] beta; // the random effects
+  real<lower=0> sigma_res; // the residual sd
+}
+model {
+//priors
+  mu_beta ~ normal(0, 100);
+  sigma_res ~ cauchy(0,5);
+// model for the random effects
+  for(j in 1:J){
+    for(d in 1:D)
+    beta[j,d] ~ normal(mu_beta[d], 10);
+    }
+// likelihood
+  for (n in 1:N) {
+    expenditure[n] ~ normal(X[n] * beta[gorx[n]],sigma_res);
+  }
+}
+generated quantities { //for use with the loo package
+  vector[N] expenditure_rep;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    expenditure_rep[n] = normal_rng(X[n] * beta[gorx[n]],sigma_res);
+    log_lik[n] = normal_lpdf(expenditure[n] | X[n] * beta[gorx[n]],sigma_res);
+}
+}","stan_models/exp_rsri.stan")
+stanc("stan_models/exp_rsri.stan")
+exp_rsri_stan_model <- stan_model("stan_models/exp_rsri.stan",
+                                  model_name="exp_rsri_stan")
+```
+
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_rsri_stan_fit <- sampling(exp_rsri_stan_model,
+                             data = exp_rsri_stan_data,
+                             init = exp_inits,
+                             warmup = 4000,
+                             iter = 5000,
+                             chains = 2)
+```
+
+
+```{r eval = FALSE}
+exp_rsri_stan_fit
+```
+
+
+
+
+
+
+```{r eval = FALSE}
+waic_rsri <- waic(log_lik_rsri)
+```
+
+
+```{r eval = FALSE}
+exp_ri_stan_inits <- list(list(beta=rep(0,D),nu=rep(0,J),
+                               sigma_res=1,sigma_nu=1),
+                          list(beta=rep(1,D),nu=rep(1,J),
+                               sigma_res=10,sigma_nu=10))
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+#random intercept + fixed slope 
+write("//stan model: linear hierarchical regression with dependent intercept
+data {
+  int<lower=1> D; // number of predictors + intercept
+  int<lower=0> N; // number of data
+  int<lower=1> J; // number of regions
+  array[N] real expenditure; // outcome
+  array[N] int<lower=1, upper=J> gorx; // the region number
+  array[N] row_vector[D] X; // the design matrix
+}
+parameters {
+  vector[D] beta; // fixed intercept and slope
+  vector[J] nu;   //region intercept
+  real<lower=0> sigma_nu;  //region sd
+  real<lower=0> sigma_res; // the residual sd
+}
+model {
+real mu; 
+
+//priors
+  sigma_res ~ cauchy(0,100);
+  sigma_nu ~ cauchy(0,100);
+  nu ~ normal(0,sigma_nu); //region random effects
+  beta ~ normal(0,100); 
+
+// likelihood
+  for (n in 1:N) {
+    mu = X[n] * beta + nu[gorx[n]];
+    expenditure[n] ~ normal(mu,sigma_res);
+  }
+}
+generated quantities { //for use with the loo package
+  vector[N] mu;
+  vector[N] expenditure_rep;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    mu[n] = X[n] * beta + nu[gorx[n]];
+    expenditure_rep[n] = normal_rng(mu[n],sigma_res);
+    log_lik[n] = normal_lpdf(expenditure[n] | mu[n],sigma_res);
+}
+}","stan_models/exp_ri.stan")
+stanc("stan_models/exp_ri.stan")
+exp_ri_stan_model <- stan_model("stan_models/exp_ri.stan",
+                                  model_name="exp_ri_stan")
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_ri_stan_fit <- sampling(exp_ri_stan_model,
+                             data = exp_rsri_stan_data,
+                             init = exp_ri_stan_inits,
+                             warmup = 4000,
+                             iter = 5000,
+                             chains = 2)
+```
+
+```{r eval = FALSE}
+exp_ri_stan_fit
+```
+
+
+
+```{r eval = FALSE}
+summary(exp_ri_stan_fit,
+        pars=c('beta[1]','beta[2]','beta[3]','beta[4]','beta[5]','beta[6]',
+               'beta[7]','beta[8]','beta[9]'
+               ),probs=c(0.025,0.975))
+```
+
+
+```{r eval = FALSE, message = FALSE}
+bayesplot::mcmc_trace(exp_ri_stan_fit,  
+                      pars=c('beta[1]','beta[2]','beta[3]','beta[4]','beta[5]','beta[6]',
+                              'beta[7]','beta[8]','beta[9]'),
+                      facet_args = list(ncol = 2, strip.position = "left"))
+#autocorrelation functions
+bayesplot::mcmc_acf(exp_ri_stan_fit,  pars=c('beta[1]','beta[2]','beta[3]','beta[4]','beta[5]',
+                                             'beta[6]','beta[7]','beta[8]','beta[9]'))
+
+exp_ri_stan_hmc <- As.mcmc.list(exp_ri_stan_fit,  pars=c('beta[1]','beta[2]','beta[3]','beta[4]',
+                                                         'beta[5]','beta[6]','beta[7]','beta[8]','beta[9]'))
+gelman.plot(exp_ri_stan_hmc)
+```
+
+
+
+
+```{r eval = FALSE, message = FALSE}
+expenditure_ri_rep <- as.matrix(exp_ri_stan_fit, pars="expenditure_rep")
+
+#loo package
+log_lik_ri <- extract_log_lik(exp_ri_stan_fit, merge_chains = FALSE)
+r_eff_ri <- relative_eff(exp(log_lik_ri), cores = 2)
+exp_ri_stan_loo <- loo(log_lik_ri, r_eff = r_eff_ri, cores = 2, save_psis = TRUE)
+psis_ri <- exp_ri_stan_loo$psis_object
+lw_ri <- weights(psis_ri)
+```
+
+
+```{r eval = FALSE, message = FALSE}
+ppc_dens_overlay(livingexp.dat$expenditure,expenditure_ri_rep)
+
+ppc_loo_pit_overlay(livingexp.dat$expenditure, expenditure_ri_rep, lw = lw_ri)
+```
+```{r eval = FALSE}
+ppc_dens_overlay_grouped(livingexp.dat$expenditure,
+                         expenditure_ri_rep,
+                         group = livingexp.dat$Gorx)
+```
+
+
+
+```{r eval = FALSE}
+waic_ri <- waic(log_lik_ri)
+```
+
+
+
+```{r eval = FALSE}
+exp_rincome_stan_inits <- list(list(beta=rep(0,D),sigma=1, sigma_income=1, beta_income=rep(0,J),sigma_res=1),
+                               list(beta=rep(0,D),sigma=10, sigma_income=5, beta_income=rep(0,J),sigma_res=5))
+
+exp_rincome_stan_data<-list(expenditure = livingexp.dat$expenditure,
+                            gorx = livingexp.dat$Gorx,
+                            income = livingexp.dat$income,
+                            X=X,
+                            N = nrow(X),
+                            J = J,
+                            D = D)
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+#random slope of income + fixed slope of categorical predictors + fixed intercept
+write("//stan model: linear hierarchical regression
+data {
+  int<lower=1> D; // number of predictors + intercept
+  int<lower=0> N; // number of data
+  int<lower=1> J; // number of regions
+  array[N] real expenditure; // outcome
+  array[N] int<lower=1, upper=J> gorx; // the region number
+  array[N] row_vector[D] X; // the design matrix
+  array[N] real income; // income predictor
+}
+parameters {
+  row_vector[D] beta; // the fixed effects 
+  real<lower=0> sigma; // the sd for fixed effect
+  real<lower=0> sigma_income; // the sd for income random effect
+  array[J] real beta_income; // the random effects for income
+  real<lower=0> sigma_res; // the residual sd
+}
+model {
+//priors
+  beta ~ normal(0,10);
+  sigma ~ cauchy(0,5);
+  sigma_income ~ cauchy(0,5);
+  beta_income ~ normal(0,100);
+  sigma_res ~ cauchy(0,5);
+// model for the random effects
+  for(j in 1:J){
+    income ~ normal(beta_income[j], sigma_income);
+    }
+// likelihood
+  for (n in 1:N) {
+    real mu;
+    mu = dot_product(X[n], beta) + income[n] * beta_income[gorx[n]];
+    expenditure[n] ~ normal(mu,sigma_res);
+  }
+}
+generated quantities { //for use with the loo package
+  vector[N] expenditure_rep;
+  vector[N] log_lik;
+  for (n in 1:N) {
+    real mu;
+    mu = dot_product(X[n], beta) + income[n] * beta_income[gorx[n]];
+    expenditure_rep[n] = normal_rng(mu, sigma_res);
+    log_lik[n] = normal_lpdf(expenditure[n] | mu,sigma_res);
+}
+}","stan_models/exp_rincome.stan")
+stanc("stan_models/exp_rincome.stan")
+exp_rincome_stan_model <- stan_model("stan_models/exp_rincome.stan",
+                                  model_name="exp_rincome_stan")
+```
+
+
+```{r eval = FALSE, message = FALSE, results = 'hide'}
+exp_rincome_stan_fit <- sampling(exp_rincome_stan_model,
+                             data = exp_rincome_stan_data,
+                             init = exp_rincome_stan_inits,
+                             warmup = 4000,
+                             iter = 5000,
+                             chains = 2)
+```
+
+
+```{r eval = FALSE}
+summary(exp_rincome_stan_fit,
+        pars=c('beta[1]','beta[2]','beta[3]','beta[4]'),probs=c(0.025,0.975))
+```
+
+
+```{r eval = FALSE}
+exp_rincome_stan_fit
+```
+
+
+```{r eval = FALSE, message = FALSE}
+bayesplot::mcmc_trace(exp_rincome_stan_fit,  pars=c('beta[1]','beta[2]','beta[3]','beta[4]'),
+                      facet_args = list(ncol = 1, strip.position = "left"))
+#autocorrelation functions
+bayesplot::mcmc_acf(exp_rincome_stan_fit,  pars=c('beta[1]','beta[2]','beta[3]','beta[4]'))
+
+exp_rincome_stan_hmc <- As.mcmc.list(exp_rincome_stan_fit,  pars=c('beta[1]','beta[2]','beta[3]','beta[4]'))
+gelman.plot(exp_rincome_stan_hmc)
+```
+
+
+```{r eval = FALSE, message = FALSE}
+expenditure_rincome_rep <- as.matrix(exp_rincome_stan_fit, pars="expenditure_rep")
+
+#loo package
+log_lik_rincome <- extract_log_lik(exp_rincome_stan_fit, merge_chains = FALSE)
+r_eff_rincome <- relative_eff(exp(log_lik_rincome), cores = 2)
+exp_rincome_stan_loo <- loo(log_lik_rincome, r_eff = r_eff_rincome, cores = 2, save_psis = TRUE)
+psis_rincome <- exp_rincome_stan_loo$psis_object
+lw_rincome <- weights(psis_rincome)
+```
+
+
+```{r eval = FALSE, message = FALSE}
+ppc_dens_overlay(nh_dat$expenditure,expenditure_rincome_rep)
+
+ppc_loo_pit_overlay(nh_dat$expenditure, expenditure_rincome_rep, lw = lw_rincome)
+```
+
+
+
+```{r eval = FALSE}
+waic_rincome <- waic(log_lik_rincome)
+```
+
+
+<br> <br>
+
+### 5. Discussion
+
+After careful consideration of convergence, fitting, and prediction performance, as well as the interpretability and complexity of the models, the Bayesian non-hierarchical model trained in Stan emerges as the optimal choice for this case. Although the hierarchical model marginally outperforms the non-hierarchical model in terms of fitting, the negligible difference in prediction and convergence suggests that the addition of regional random effects may not be justified. This implies that the explanatory contribution of areas on household expenditure is relatively minor compared to other variables. Consequently, the final model is formulated as follows: `expenditure = 2.39 - 0.3*A1722 - 0.33*A094r2 - 0.1*A094r3 - 0.11*A094r4 - 0.15*A094r5 + 0.17*A121r2 + 0.11*A121r3 + 0.58*income`.
+
+
+All coefficients in the model represent fixed effects. Analysis of the coefficients reveals insightful patterns. For instance, the coefficients associated with variable `A094r` are consistently negative, indicating that compared to households with reference personnel in higher managerial, administrative, and professional occupations (`A094r1`), households with reference personnel in other occupation categories tend to have lower expenditures. Specifically, if all other variables remain constant, households with reference personnel in intermediate occupations (`A094r2`) are estimated to spend approximately 71.89% of households of `A094r1`. Similarly, holding all other variables constant, households without internet connection (`A1722`) are estimated to spend approximately 74.08% of the households with internet connection (`A1721`). On the other hand, the positive coefficient associated with variable `A121r` suggests that households in private rental or owner-occupied tenure spend more compared to households in publicly rented tenure (`A121r1`). Furthermore, households with higher incomes tend to have higher expenditures.
+
+
+ It's clear that there's still room for improvement in the current model. While the impact of regions on the model may be limited, it doesn't necessarily imply that there are no differences in household expenditure between regions. One potential avenue for improvement could involve refining the regional hierarchy, such as focusing on household spending within specific London boroughs. Narrowing down the analysis to smaller geographic areas could reveal more nuanced and intriguing insights into household expenditure patterns, potentially uncovering subtle differences that were previously overlooked and improving model's prediction on the turning points of each region. 
+
+
+<br><br>
+
+### 6. Summary
+
+In summary, we can attribute differences in household spending to factors such as income level, internet connectivity, occupation of the household reference person, and tenure status. At the current regional level, there isn't a significant disparity or correlation in household expenditure across regions. However, households with higher incomes, owning their residencies, having internet access, and being engaged in professional or managerial occupations tend to exhibit higher expenditures. Among these factors, household income exerts the most significant influence on spending behavior. Holding other variables constant, a unit increase in income corresponds to approximately 78.6% growth in spending.
+
+
+
+<br><br><br><br>
+
+
+## Spatial dataset
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(gridExtra)
+library(INLA)
+library(broom)
+library(spdep)
+library(lubridate)
+library(sf)
+library(lwgeom)
+library(viridis)
+library(png)
+```
+
+
+### 1. Introduction
+
+This project aims to understand the changing pattern of Covid-19 deaths in the United States spanning 2020 Febuary to 2021 September. It seeks to address problems regarding the variations in deaths across different regions (states/counties) during distinct timeframes and the influence of demographic factors on these fluctuations. This study incorporates data source from multiple channels, including poverty ratio `PropPov`, white population ratio `PropWhite`, male ratio `PropMen` as independent variables and population at county level `TOT_POP` as offset variable. The monthly death is utilized as the dependent variable for analysis.
+
+Initially, I build spatio-temporal models to analyze the death toll in Alabama, incorporating both models without space-time interaction and those with interaction terms. Then, I explore the fluctuations in Covid-19 deaths within New York State. Given its distinct political-economic landscape, higher population density, and an earlier onset of the outbreak, I compare these trends with those observed in Alabama. I aim to study the primary factors influencing death counts across different states, considering the significance of demographic attributes in this context. 
+
+
+```{r warning = FALSE}
+ethnicity <- read.csv("US_Covid_Disc_processed/US_ethnicity_2019.csv",header=T)
+#head(ethnicity)
+ethnicity <- subset(ethnicity, State=="Alabama")
+Totalwhite <- ethnicity$WA_MALE + ethnicity$WA_FEMALE
+ethnicity <- ethnicity %>% mutate(PropWhite=Totalwhite/TOT_POP)
+ethnicity <- ethnicity %>% mutate(PropMen=TOT_MALE/TOT_POP)
+ethnicity <- dplyr::select(ethnicity, State, TOT_POP, PropWhite, PropMen,FIPS.Code)
+
+poverty <- read.csv("US_Covid_Disc_processed/USpovertycounty2019.csv", header=T)
+#head(poverty) 
+poverty <- subset(poverty, Postal.Code=="AL")
+
+covariates <- full_join(ethnicity, poverty)
+covariates <- covariates[,-c(6,7)]
+covariates$pov.estimates.all.ages <- as.numeric(covariates$pov.estimates.all.ages)
+covariates <- covariates %>% mutate(PropPov = pov.estimates.all.ages/TOT_POP)
+
+covid.deaths <- read.csv("US_Covid_Disc_processed/proj_covid_deaths_by_county.csv", header=T)
+covid.deaths <- subset(covid.deaths, State=="AL")
+covid.deaths <- covid.deaths[,-3]
+
+#reduce to months
+covid.month.deaths<- covid.deaths %>% mutate(Month=month(date,label = T),                                       Month.num=((lubridate::month(lubridate::ymd(date))-1)+(lubridate::year(lubridate::ymd(date))-2020)*12)) %>% group_by(Month.num,Month,County.Name, countyFIPS) %>% summarise(monthly.deaths=sum(deaths,na.rm=T))
+
+#join with covariate information
+covid.month.deaths<- left_join(covid.month.deaths, covariates, by=c("countyFIPS" ="FIPS.Code"))
+
+#reduce the number of columns
+covid.month.deaths <- covid.month.deaths %>%
+  dplyr::select(!c("Postal.Code","Name"))
+```
+
+
+
+```{r}
+#load the shp file
+US.spatial<- read_sf("USA_Counties/USA_Counties.shp")
+alabama.spatial = subset(US.spatial , STATE_NAME=="Alabama")
+
+#check and repair geometries
+alabama.spatial <- st_make_valid(alabama.spatial)
+#turn FIPS into same format
+alabama.spatial$FIPS <- as.numeric(substring(alabama.spatial$FIPS,2))
+#prepares the spatial.polygon data for INLA
+alabama.poly <- poly2nb(alabama.spatial)
+#save it in the directory
+nb2INLA("USA_Counties/alabama.graph",alabama.poly)
+#get it from the directory and into an INLA friendly format
+alabama.adj <- inla.read.graph(filename="USA_Counties/alabama.graph")
+```
+
+
+
+```{r warning = FALSE}
+#merge the data with the map
+covid.al.sf <- st_as_sf(alabama.spatial)
+covid.al.deaths <- left_join(covid.al.sf, covid.month.deaths, by=c("FIPS"="countyFIPS"))
+
+ncty.al <- length(unique(covid.al.deaths$County.Name))
+
+#look.up
+look.up.al <- data.frame(NAME = unique(covid.al.deaths$County.Name),
+                      num_id = seq(1:ncty.al))
+
+#join
+covid.dat.al = left_join(covid.al.deaths,look.up.al)
+```
+
+<br><br>
+
+
+### 2. Exploratory Data Analysis (Alabama)
+
+We observe a consistent increase in the total number of deaths statewide, indicative of the persistent impact of the outbreak. The surge in deaths happened in the 10th-14th month period. Although the number of deaths remained stable after the 15th month, it stayed at a high level of more than 300,000, suggesting that the spread of Covid-19 has not been effectively controlled during the observation period. 
+
+
+```{r eval = FALSE, message = FALSE}
+#compute the monthly death counts of all counties
+death_month_counts <- covid.month.deaths %>% 
+  select(Month.num, monthly.deaths) %>%
+  group_by(Month.num) %>%
+  summarise(month_count = sum(monthly.deaths, na.rm = T)) 
+
+#plot
+ggplot(data = death_month_counts, aes(x = Month.num, y = month_count)) +
+  geom_line(color = "dodgerblue") +
+  geom_point(color = "dodgerblue") +
+  labs(title = "Monthly Death Counts (2020.02-2021.09)",
+       x = "Month Number",
+       y = "Death Count") +
+  theme_minimal()
+```
+
+Jefferson and Mobile counties, being among the most populous, record significantly higher death counts. The mortality rate (deaths/total population) paints a nuanced picture, counties with smaller population exhibit elevated mortality rates.
+
+
+```{r eval = FALSE, warning = FALSE}
+death_county_counts <- covid.dat.al %>%
+  mutate(death.rate = monthly.deaths / TOT_POP)
+
+death_county_counts <- death_county_counts %>%
+  select(monthly.deaths, County.Name, death.rate) %>%
+  group_by(County.Name) %>%
+  summarise(deaths = sum(monthly.deaths),
+            death.rate = mean(death.rate))
+
+p1 <- ggplot(death_county_counts, aes(fill = deaths)) + 
+      geom_sf()+
+      #scale_fill_continuous(low = "white", high = "black") +
+      theme_void() +
+      geom_sf_text(size = 2.5, aes(label = County.Name), colour = "white")
+
+p2 <- ggplot(death_county_counts, aes(fill = death.rate)) + 
+      geom_sf()+
+      #scale_fill_continuous(low = "white", high = "black") +
+      theme_void() +
+      geom_sf_text(size = 2, aes(label = County.Name), colour = "white")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+The scatter plot shows that there is correlation between the male ratio, white population ratio, and poverty ratio, which implies that demographic characteristics intersect with socioeconomic status. For example, certain demographic groups, such as white males are less likely to live at a poverty level and they may face larger or smaller challenges of Covid-19.
+
+In addition, the distribution of monthly deaths is over-dispersed with a large variance, so a Negative binomial distribution will be used for modeling.
+
+```{r}
+covid.month.deaths <- covid.month.deaths %>%
+   mutate(death.rate = monthly.deaths / TOT_POP)
+
+attach(covid.month.deaths)
+variables <- as.data.frame(cbind(death.rate, PropMen, PropWhite, PropPov))
+plot(variables)
+```
+
+```{r eval = FALSE}
+#check whether should try zero-inflated model
+sum(covid.month.deaths$monthly.deaths == 0)
+
+# check whether should try negative binomial model
+mean(covid.month.deaths$monthly.deaths)
+var(covid.month.deaths$monthly.deaths)
+# over-dispersion
+```
+
+```{r eval = FALSE}
+#Spatial Model with 3 predictors (poisson)
+covid.al.formula <- monthly.deaths ~ 1 + PropWhite + PropMen + PropPov +
+  f(num_id,
+    model="bym",
+    graph=alabama.adj,
+    constr=T)
+```
+
+```{r eval = FALSE}
+#run INLA
+covid.al.inla <- inla(covid.al.formula,
+                      family="poisson",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute=list(waic=TRUE))
+```
+
+
+```{r eval = FALSE}
+covid.al.inla$summary.fixed
+```
+
+```{r eval = FALSE}
+#Spatial Model with 1 predictor (poisson)
+covid.al.formula <- monthly.deaths ~ 1 + PropPov +
+  f(num_id,
+    model="bym",
+    graph=alabama.adj,
+    constr=T)
+```
+
+
+```{r eval = FALSE}
+#run INLA
+covid.al.inla <- inla(covid.al.formula,
+                      family="poisson",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+#check the waic value
+covid.al.inla$waic$waic
+
+cpo <- covid.al.inla$cpo$cpo
+cpo[cpo == 0] <- 1e-10
+sum(-log(cpo))
+```
+```{r eval = FALSE}
+# Spatial Model with 1 predictor (NB)
+covid.al.nb.inla <- inla(covid.al.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+covid.al.nb.inla$waic$waic
+sum(-log(covid.al.nb.inla$cpo$cpo))
+```
+
+
+```{r eval = FALSE}
+#obtain the fractional variation
+set.seed(68)
+
+nsamp <- 100000
+var.mat<-matrix(NA, nrow=ncty.al, ncol=nsamp)
+
+#u.dist contains the points that describe the pdf for each one 
+#use rmarginal to sample from this distribution
+u.dist<-covid.al.nb.inla$marginals.random$num_id
+
+for (i in 1:ncty.al){
+  #allocate the correct distribution
+  u <- u.dist[[ncty.al+1]]
+  #sample from the distribution
+  var.mat[i,] <- inla.rmarginal(nsamp,u)
+}
+
+var.u <- apply(var.mat,2,var)
+
+var.nu <- inla.rmarginal(nsamp,
+                         inla.tmarginal(
+                           function(x)
+                             1/x,
+                           covid.al.nb.inla$marginals.hyperpar$`Precision for num_id (iid component)`
+                         ))
+
+#mean(var.u/(var.u+var.nu))
+```
+
+
+
+```{r}
+#Spatio-Temporal Model with 1 predictor (NB)
+
+#unstructed temporal
+Month.num1 <- covid.dat.al$Month.num
+
+#interaction term
+num_id.month <- paste(covid.dat.al$num_id, covid.dat.al$Month.num, sep="_")
+
+
+#model without interaction
+#model with random walk
+covid.al.rw2.formula <- monthly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") 
+
+covid.al.rw2.inla <- inla(covid.al.rw2.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+#linear model
+covid.al.lin.formula <- monthly.deaths ~ 1 + PropPov + Month.num +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj,constr = TRUE) +
+  #the spatial/temporal interaction term with delta coefficients
+  f(Month.num1,num_id,model="iid",constr = TRUE)
+
+covid.al.lin.inla <- inla(covid.al.lin.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+
+
+```{r eval = FALSE}
+#time trend plot
+covid.al.iid <- unlist(
+  lapply(covid.al.rw2.inla$marginals.random$Month.num1,
+         function(x){
+           inla.emarginal(exp,x)})
+)
+
+covid.al.rw2 <- unlist(
+  lapply(covid.al.rw2.inla$marginals.random$Month.num,
+         function(x){
+           inla.emarginal(exp,x)
+         })
+)
+
+covid.al.lin <- unlist(
+  lapply(covid.al.lin.inla$marginals.random$Month.num1,
+         function(x){
+           inla.emarginal(exp,x)
+         })
+)
+
+covid.al.time.plot <- data.frame(temp=covid.al.rw2,
+                                  iid=covid.al.iid,
+                                  lin=covid.al.lin,
+                                  Month.num=1:20)
+covid.al.time.plot <- pivot_longer(covid.al.time.plot, cols = !Month.num)
+```
+
+
+<br><br>
+
+### 3. Spatio-Temporal Models
+
+#### 3.1 Spatio-Temporal Models without Interaction 
+
+In the full model incorporating three explanatory variables,  I found that the coefficients of `PopWhite` and  `PopMen` were not significant at the level of 95%, so only `PropPov` was retained as the explanatory variable. This suggests that `PropPov` potentially picks up the explanatory contribution of `PopWhite` and  `PopMen` to the outcome, and thus we don't need to consider interactions between these variables further.
+
+The plot of time component shows the effect of time component on the outcome in the original scale. The "rw2" line exhibits the most pronounced fluctuations and displays an overall upward trend, mirroring the previous EDA time trend chart for statewide deaths. This suggests that the impact of time on monthly deaths increases over time, with notable spikes occurring around the 10th month. Conversely, the "iid" and "lin" lines remain stable around 1, indicating minimal impact on the number of deaths. This could be attributed to the dominance of the random walk component in the RW2 model, which captures most of the time effect. Similarly, in the linear model, the linear fixed effect of time plays a primary explanatory role.
+
+Given the absence of periodicity in the model with months as the unit, I change the time unit from months to weeks later to discern subtle differences in time changes. This approach aims to investigate whether any seasonal or cyclical variations manifest differently at the weekly level.
+
+```{r eval = FALSE}
+q1_time <- ggplot(covid.al.time.plot,aes(x=Month.num,y=value,linetype=name,color=name)) +
+  geom_line() +
+  ggtitle("Time Trend Plot of Time Component") +
+  theme_minimal()
+
+q1_time
+```
+
+In the fitted value plot, it's evident that temporal changes had the most significant impact on Jefferson County and Mobile County. The number of deaths in these two counties exhibited a notable increase starting around the 8th month, marking them as early hotspots within Alabama to experience a surge in fatalities. As time progressed, the epidemic expanded, leading to a gradual rise in deaths in the surrounding counties of Jefferson. Positioned in the southwest corner of Alabama, Mobile County has fewer neighboring counties, resulting in a more localized impact compared to Jefferson. This highlights the substantial influence of both time and space on the deaths in Alabama. Particularly, the evolving patterns of fatalities in the counties surrounding Jefferson County highlight the interaction between time and space with discernible neighborhood structure and time lag.
+
+
+```{r}
+#plot for fitted values
+#covid.dat.al$lin.fit <- covid.al.lin.inla$summary.fitted.values$mean
+covid.dat.al$rw2.fit <- covid.al.rw2.inla$summary.fitted.values$mean
+```
+
+
+```{r}
+target <- c(1,4,8,12,15,18)
+covid.al.fitted <- filter(covid.dat.al, Month.num %in% target) %>%
+  group_by(num_id, Month.num) %>%
+  summarise_at(c("rw2.fit"), sum)
+
+ggplot(covid.al.fitted, aes(fill=rw2.fit,geometry=geometry)) +
+  geom_sf() +
+  scale_fill_viridis(option = "cividis") +
+  theme_void() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(~Month.num)
+```
+
+```{r eval = FALSE}
+#Type 1
+covid.al.type1.formula <- monthly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.month,model="iid")
+
+covid.al.type1.inla <- inla(covid.al.type1.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+
+#length(covid.al.type1.inla$marginals.random$num_id.month)
+```
+
+
+```{r}
+#temporal
+month.int <- covid.dat.al$Month.num
+
+#spatial
+num_id.int <- covid.dat.al$num_id
+```
+
+
+```{r eval = FALSE}
+#Type 2
+covid.al.type2.formula <- monthly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.int,model="iid",
+    #iid on the spatial component
+    group = month.int,
+    #rw2 structure on the temporal component
+    control.group = list(model="rw2"))
+
+
+covid.al.type2.inla <- inla(covid.al.type2.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+#Type 3
+covid.al.type3.formula <- monthly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(month.int,model="iid",
+    #iid on the temporal component
+    group = num_id.int,
+    #rw2 structure on the spatial component
+    control.group = list(model="besag"), graph = alabama.adj)
+
+
+covid.al.type3.inla <- inla(covid.al.type3.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+
+```{r}
+#Type 4
+covid.al.type4.formula <- monthly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.int,model="besag",graph = alabama.adj,
+    group = month.int,
+    control.group = list(model="rw2"))
+
+
+covid.al.type4.inla <- inla(covid.al.type4.formula,
+                      family="nbinomial",
+                      data=covid.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+covid.al.rw2.inla$waic$waic
+covid.al.lin.inla$waic$waic
+covid.al.type1.inla$waic$waic
+covid.al.type2.inla$waic$waic
+covid.al.type4.inla$waic$waic
+```
+
+
+#### 3.2 Spatio-Temporal Models with Interaction 
+
+Due to the evident structural spatio-temporal interaction observed in the Covid-19 deaths in Alabama, I opted for the Type4 spatio-temporal interaction model, and the interaction term is `structured spatial component (besage) * structured temporal component (RW2)`. Notably, the Type4 model demonstrated superior fitting performance compared to other spatio-temporal models with the smallest WAIC value. Particularly, its fitting efficacy significantly surpassed that of the Type1 model, which featured an interaction term of `iid`. 
+
+The figure of fitted values illustrates the disparities in fitted values among different models. While the contrast between the Type1 model and the non-interactive model is marginal, with a difference of less than 10, a substantial gap emerges between Type1 and Type4 models. This discrepancy highlights that the  significant variance between interactive and non-interactive models predominantly originates from the inherent structured interaction mode within the interactive components.
+
+```{r eval = FALSE}
+#function to plot the fitted values
+int.fit.plot <- function(covid.dat.al, covid.al.rw2.inla.mean, 
+                         covid.al.type.inla.mean, int=int) {
+  #create the data
+  if (int==0) {
+    delta.int <- data.frame(delta=covid.al.rw2.inla.mean,
+                            num_id=rep(unique(covid.dat.al$num_id), each=20),
+                            Month.num=rep(unique(covid.dat.al$Month.num), times=67))
+    ylim.plot <- c(0,60000)
+  } else {
+    
+    delta.int <- data.frame(delta=covid.al.rw2.inla.mean - covid.al.type.inla.mean,
+                            num_id=rep(unique(covid.dat.al$num_id), each=20),
+                            Month.num=rep(unique(covid.dat.al$Month.num), times=67))
+    ylim.plot <- c(-15,15)
+  }
+  
+  p1 <- ggplot(delta.int,aes(x=jitter(Month.num), y=delta, colour=factor(num_id))) +
+    geom_point()+
+    geom_smooth(se=FALSE)+
+    coord_cartesian(ylim=ylim.plot) +
+    theme(legend.position="none",plot.title = element_text(size =6))+
+    ggtitle(paste("Type=",int," Over months by area",sep="")) 
+  
+  p2<- ggplot(delta.int,aes(x=num_id, y=delta, colour=factor(Month.num))) +
+    geom_point()+
+    geom_smooth(se=FALSE)+
+    coord_cartesian(ylim=ylim.plot) +
+    theme(legend.position="none",plot.title = element_text(size = 6))+
+    ggtitle(paste("Type=",int," Over area by months",sep="")) 
+  
+  q <- grid.arrange(p1,p2,nrow=1)
+}
+```
+
+
+```{r eval = FALSE, message = FALSE}
+#difference between rw2 and type1
+fitted_q1 <- int.fit.plot(covid.al.rw2.inla.mean=covid.al.rw2.inla$summary.fitted.values$mean,
+                   covid.al.type.inla.mean=covid.al.type1.inla$summary.fitted.values$mean,
+                   covid.dat.al=covid.dat.al,int=1)
+ggsave("plot/fitted_q1.png",fitted_q1)
+
+#difference between type1 and type4
+fitted_q2 <- int.fit.plot(covid.al.rw2.inla.mean=covid.al.type1.inla$summary.fitted.values$mean,
+                   covid.al.type.inla.mean=covid.al.type4.inla$summary.fitted.values$mean,
+                   covid.dat.al=covid.dat.al,int=2)
+ggsave("plot/fitted_q2.png",fitted_q2)
+
+#difference between type2 and type4
+fitted_q3 <- int.fit.plot(covid.al.rw2.inla.mean=covid.al.type2.inla$summary.fitted.values$mean,
+                   covid.al.type.inla.mean=covid.al.type4.inla$summary.fitted.values$mean,
+                   covid.dat.al=covid.dat.al,int=3)
+ggsave("plot/fitted_q3.png",fitted_q3)
+
+```
+
+
+The following chart illustrates the impact of interaction terms on deaths across regions at different time points. A notable observation is the fluctuation observed in Baldwin County, which shares a significant border with Mobile County. Around the 8th month, the interaction between spatial adjacency and time had a discernible influence on the death toll in Baldwin County, which might lead to an increase in fatalities afterwards (as shown in the fitted plot of time). Around the 18th month, the impact of the interaction term on Baldwin County diminished. This could be attributed to the stabilization of the epidemic's spread, leading to a weakening effect of space-time interaction. Other factors began to play a more prominent role in monthly deaths in this area.
+
+Notably, counties surrounding Jefferson, such as Tuscaloosa and Shelby, exhibit stable patterns under the influence of spatio-temporal interaction terms, with the log of interaction term hovering around 0. This, coupled with the sustained high number of outbreak-related deaths in the region, suggests ongoing epidemic impact throughout the observation period. This underscores the interconnected nature of these regions, where Covid-19 continues to exert its influence intersectingly.
+
+```{r}
+#function to plot the interaction plots
+int.evo.plot <- function(covid.dat.al, covid.al.type.inla.mean) {
+  
+  #create the data
+  delta.int <- data.frame(delta=covid.al.type.inla.mean,
+                          num_id=rep(unique(covid.dat.al$num_id), each=20),
+                          Month.num=rep(unique(covid.dat.al$Month.num), times=67))
+  
+  delta.int <- left_join(covid.dat.al,delta.int)
+  
+  #only plot 
+  target <- c(1,4,8,12,15,18)
+  delta.int <- subset(delta.int, Month.num %in% target)
+  
+  ggplot(delta.int, aes(fill=delta, geometry=geometry)) +
+    geom_sf() +
+    theme_void () +
+    theme(legend.title = element_blank()) +
+    facet_wrap(~ Month.num)
+
+}
+
+#plot the interaction term of Type4
+q4 <- int.evo.plot(covid.dat.al=covid.dat.al,
+                   covid.al.type.inla.mean=covid.al.type4.inla$summary.random$num_id.int$mean)
+
+q4
+
+#save the plot
+#ggsave("plot/interaction_type4.png", q4)
+```
+
+
+```{r}
+#plot for fitted values
+covid.dat.al$type4.fit <- covid.al.type4.inla$summary.fitted.values$mean
+```
+
+```{r}
+target <- c(1,4,8,12,15,18)
+covid.al.fitted <- filter(covid.dat.al, Month.num %in% target) %>%
+  group_by(num_id, Month.num) %>%
+  summarise_at(c("type4.fit"), sum)
+
+ggplot(covid.al.fitted, aes(fill=type4.fit,geometry=geometry)) +
+  geom_sf() +
+  scale_fill_viridis(option = "cividis") +
+  theme_void() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(~Month.num)
+```
+
+<br><br>
+
+### 4. Spatio-Temporal Models with Week as Time Unit
+
+After transitioning from monthly to weekly time units, no cyclical or seasonal changes were observed. The effects of the `iid`, `lin`, and `temp` terms on the number of deaths remained consistent with those in the monthly model. Interestingly, while in the monthly model, the impact of time on the outcome declined towards the end of the observation period, in the weekly model, this impact continued to strengthen significantly. This discrepancy could be attributed to the smaller time units of weeks, rendering the model more sensitive to short-term fluctuations. Consequently, the model is able to detect abrupt increases or decreases occurring towards the conclusion of the observation period.
+
+
+```{r warning=FALSE}
+#reduce to weeks
+covid.week.deaths<- covid.deaths %>% 
+  mutate(Week=isoweek(date),
+         Week.num=ifelse(year(date)==2020, (Week-4), (49+Week))) %>%
+  group_by(Week.num,Week,County.Name, countyFIPS) %>% 
+  summarise(weekly.deaths=sum(deaths,na.rm=T))
+
+covid.week.deaths <- covid.week.deaths[1:5829,]
+
+#join with covariate information
+covid.week.deaths<- left_join(covid.week.deaths, covariates, by=c("countyFIPS" ="FIPS.Code"))
+
+#reduce the number of columns
+covid.week.deaths <- covid.week.deaths %>%
+  dplyr::select(!c("Postal.Code","Name"))
+```
+
+
+```{r warning=FALSE}
+#merge the data with the map
+covid.al.week.deaths <- left_join(covid.al.sf, covid.week.deaths, by=c("FIPS"="countyFIPS"))
+
+ncty.week.al <- length(unique(covid.al.week.deaths$County.Name))
+
+#look.up
+look.up.week.al <- data.frame(NAME = unique(covid.al.week.deaths$County.Name),
+                      num_id = seq(1:ncty.week.al))
+
+#join
+covid.week.dat.al = left_join(covid.al.week.deaths,look.up.week.al)
+```
+
+```{r}
+#unstructed temporal
+Week.num1 <- covid.week.dat.al$Week.num
+
+#interaction term
+num_id.week <- paste(covid.week.dat.al$num_id, covid.week.dat.al$Week.num, sep="_")
+```
+
+
+```{r}
+#model without interaction
+#model with random walk
+covid.al.rw2.week.formula <- weekly.deaths ~ 1 + PropPov +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj) +
+  #structured time
+  f(Week.num,model="rw2") +
+  #iid time
+  f(Week.num1, model="iid") 
+
+covid.al.rw2.week.inla <- inla(covid.al.rw2.week.formula,
+                      family="nbinomial",
+                      data=covid.week.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+#linear model
+covid.al.lin.week.formula <- weekly.deaths ~ 1 + PropPov + Week.num +
+  #structured spatial
+  f(num_id,model="bym",graph=alabama.adj,constr = TRUE) +
+  #the spatial/temporal interaction term with delta coefficients
+  f(Week.num1,num_id,model="iid",constr = TRUE)
+
+covid.al.lin.week.inla <- inla(covid.al.lin.week.formula,
+                      family="nbinomial",
+                      data=covid.week.dat.al,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+
+```{r eval = FALSE}
+#time trend plot
+covid.al.week.iid <- unlist(
+  lapply(covid.al.rw2.week.inla$marginals.random$Week.num1,
+         function(x){
+           inla.emarginal(exp,x)})
+)
+
+covid.al.week.rw2 <- unlist(
+  lapply(covid.al.rw2.week.inla$marginals.random$Week.num,
+         function(x){
+           inla.emarginal(exp,x)
+         })
+)
+
+covid.al.week.lin <- unlist(
+  lapply(covid.al.lin.week.inla$marginals.random$Week.num1,
+         function(x){
+           inla.emarginal(exp,x)
+         })
+)
+
+covid.al.time.week.plot <- data.frame(temp=covid.al.week.rw2,
+                                  iid=covid.al.week.iid,
+                                  lin=covid.al.week.lin,
+                                  Week.num=1:87)
+covid.al.time.week.plot <- pivot_longer(covid.al.time.week.plot, cols = !Week.num)
+```
+
+
+```{r eval = FALSE, message = FALSE}
+q2_time <- ggplot(covid.al.time.week.plot,aes(x=Week.num,y=value,linetype=name,color=name)) +
+  geom_line() +
+  ggtitle("Time Trend Plot of Time Component")
+  theme_minimal()
+
+q2_time
+```
+
+The figure below provides a breakdown of how the outbreak of deaths unfolded during the 50th-60th week period, offering a nuanced pattern to comprehend the fluctuations in the number of deaths.
+
+```{r}
+#plot for fitted values
+#covid.week.dat.al$lin.fit <- covid.al.lin.week.inla$summary.fitted.values$mean
+covid.week.dat.al$rw2.fit <- covid.al.rw2.week.inla$summary.fitted.values$mean
+```
+
+```{r}
+target <- c(50,52,53,54,56,58)
+covid.al.week.fitted <- filter(covid.week.dat.al, Week.num %in% target) %>%
+  group_by(num_id, Week.num) %>%
+  summarise_at(c("rw2.fit"), sum)
+
+ggplot(covid.al.week.fitted, aes(fill=rw2.fit,geometry=geometry)) +
+  geom_sf() +
+  scale_fill_viridis(option = "cividis") +
+  theme_void() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(~Week.num)
+```
+
+<br><br>
+
+
+### 5. Discussion
+
+There are some limitations regarding the current analysis.
+
+* Firstly, the observation period is restricted, and the chosen time points lack background information, particularly at the endpoint. Consequently, the analysis fails to capture a full cycle of the epidemic's spread, development, and mitigation efforts. This results in a simplistic portrayal of the role of time in the analysis. Addressing this limitation would require extending the observation period and ensuring that the selected time nodes are well-grounded in relevant contextual information.
+
+* Secondly, in areas characterized by low economic levels and population density, additional factors such as accessibility to healthcare services and the effectiveness of epidemic detection measures should be considered. It's plausible that there could be underreporting or underdetection of epidemic-related deaths due to limited access to medical services or deficiencies in detection mechanisms. This could introduce bias into the results. 
+
+
+<br><br>
+
+
+### 6. Covid-19 Deaths in New York State
+
+In contrast to Alabama, New York showed no significant correlation between the male ratio, white ratio, and poverty ratio variables. Deaths were predominantly concentrated in highly urbanized, densely populated areas such as New York City, Queens, and Kings County. Given the over-dispersion nature of monthly deaths in New York State, negative binomial regression was employed for modeling purposes. In the full model incorporating 3 predictors, none of the three variables reach significance, and thus they were not included in the spatio-temporal models. This suggests that time and space may play a more significant role in understanding the changing patterns of Covid-19 deaths compared to other demographic factors, especially in metropolitan areas with a greater racial and cultural diversity where death tolls are elevated. 
+
+
+
+
+```{r warning=FALSE}
+ethnicity <- read.csv("US_Covid_Disc_processed/US_ethnicity_2019.csv",header=T)
+#head(ethnicity)
+ethnicity <- subset(ethnicity, State=="New York")
+Totalwhite <- ethnicity$WA_MALE + ethnicity$WA_FEMALE
+ethnicity <- ethnicity %>% mutate(PropWhite=Totalwhite/TOT_POP)
+ethnicity <- ethnicity %>% mutate(PropMen=TOT_MALE/TOT_POP)
+ethnicity <- dplyr::select(ethnicity, State, TOT_POP, PropWhite, PropMen,FIPS.Code)
+
+poverty <- read.csv("US_Covid_Disc_processed/USpovertycounty2019.csv", header=T)
+#head(poverty) 
+poverty <- subset(poverty, Postal.Code=="NY")
+
+covariates <- full_join(ethnicity, poverty)
+covariates <- covariates[,-c(6,7)]
+covariates$pov.estimates.all.ages <- as.numeric(covariates$pov.estimates.all.ages)
+covariates <- covariates %>% mutate(PropPov = pov.estimates.all.ages/TOT_POP)
+
+covid.deaths.ny <- read.csv("US_Covid_Disc_processed/proj_covid_deaths_by_county.csv", header=T)
+covid.deaths.ny <- subset(covid.deaths.ny, State=="NY")
+covid.deaths.ny <- covid.deaths.ny[,-3]
+
+#reduce to months
+covid.month.deaths.ny<- covid.deaths.ny %>% mutate(Month=month(date,label = T),                                       Month.num=((lubridate::month(lubridate::ymd(date))-1)+(lubridate::year(lubridate::ymd(date))-2020)*12)) %>% group_by(Month.num,Month,County.Name, countyFIPS) %>% summarise(monthly.deaths=sum(deaths,na.rm=T))
+
+#join with covariate information
+covid.month.deaths.ny<- left_join(covid.month.deaths.ny, covariates, by=c("countyFIPS" ="FIPS.Code"))
+
+#reduce the number of columns
+covid.month.deaths.ny <- covid.month.deaths.ny %>%
+  dplyr::select(!c("Postal.Code","Name"))
+```
+
+
+
+```{r warning=FALSE}
+#load the shp file
+US.spatial<- read_sf("NY_counties/tl_2023_us_county.shp")
+newyork.spatial = subset(US.spatial , STATEFP=="36")
+
+#check and repair geometries
+newyork.spatial <- st_make_valid(newyork.spatial)
+#turn FIPS into same format
+newyork.spatial$COUNTYFP <- as.numeric(paste0("36",newyork.spatial$COUNTYFP))
+#prepares the spatial.polygon data for INLA
+newyork.poly <- poly2nb(newyork.spatial)
+#save it in the directory
+nb2INLA("NY_Counties/newyork.graph",newyork.poly)
+#get it from the directory and into an INLA friendly format
+newyork.adj <- inla.read.graph(filename="NY_Counties/newyork.graph")
+```
+
+
+```{r warning=FALSE}
+#merge the data with the map
+covid.ny.sf <- st_as_sf(newyork.spatial)
+covid.ny.deaths <- left_join(covid.ny.sf, covid.month.deaths.ny, by=c("COUNTYFP"="countyFIPS"))
+
+ncty.ny <- length(unique(covid.month.deaths.ny$County.Name))
+
+#look.up
+look.up.ny <- data.frame(NAME = unique(covid.ny.deaths$County.Name),
+                      num_id = seq(1:ncty.ny))
+
+#join
+covid.dat.ny = left_join(covid.ny.deaths,look.up.ny)
+```
+
+
+```{r eval = FALSE, warning = FALSE}
+death_county_counts_ny <- covid.dat.ny %>%
+  mutate(death.rate = monthly.deaths / TOT_POP)
+
+death_county_counts_ny <- death_county_counts_ny %>%
+  dplyr::select(monthly.deaths, County.Name, death.rate) %>%
+  group_by(County.Name) %>%
+  summarise(deaths = sum(monthly.deaths),
+            death.rate = mean(death.rate))
+
+p1 <- ggplot(death_county_counts_ny, aes(fill = deaths)) + 
+      geom_sf()+
+      #scale_fill_continuous(low = "white", high = "black") +
+      theme_void() +
+      geom_sf_text(size = 1.5, aes(label = County.Name), colour = "white")
+
+p2 <- ggplot(death_county_counts_ny, aes(fill = death.rate)) + 
+      geom_sf()+
+      #scale_fill_continuous(low = "white", high = "black") +
+      theme_void() +
+      geom_sf_text(size = 1.5, aes(label = County.Name), colour = "white")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r eval = FALSE, message = FALSE}
+covid.month.deaths.ny <- covid.month.deaths.ny %>%
+   mutate(death.rate = monthly.deaths / TOT_POP)
+
+attach(covid.month.deaths.ny)
+variables <- as.data.frame(cbind(death.rate, PropMen, PropWhite, PropPov))
+plot(variables)
+```
+
+```{r eval = FALSE}
+#check whether should try zero-inflated model
+sum(covid.month.deaths.ny$monthly.deaths == 0)
+
+# check whether should try negative binomial model
+mean(covid.month.deaths.ny$monthly.deaths)
+var(covid.month.deaths.ny$monthly.deaths)
+# over-dispersion
+```
+
+```{r eval = FALSE}
+#write down the formula with 3 predictors
+covid.ny.formula <- monthly.deaths ~ 1 + PropWhite + PropMen + PropPov +
+  f(num_id,
+    model="bym",
+    graph=newyork.adj,
+    constr=T)
+
+#run INLA
+covid.ny.inla <- inla(covid.ny.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute=list(waic=TRUE))
+```
+
+
+```{r eval = FALSE}
+covid.ny.inla$summary.fixed
+```
+
+
+```{r}
+#unstructed temporal
+Month.num1 <- covid.dat.ny$Month.num
+
+#temporal
+month.int <- covid.dat.ny$Month.num
+
+#spatial
+num_id.int <- covid.dat.ny$num_id
+
+#interaction term
+num_id.month <- paste(covid.dat.ny$num_id, covid.dat.ny$Month.num, sep="_")
+```
+
+
+```{r eval = FALSE}
+covid.ny.rw2.formula <- monthly.deaths ~ 1 + 
+  #structured spatial
+  f(num_id,model="bym",graph=newyork.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") 
+
+covid.ny.rw2.inla <- inla(covid.ny.rw2.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+```{r eval = FALSE}
+#Type 1
+covid.ny.type1.formula <- monthly.deaths ~ 1 + 
+  #structured spatial
+  f(num_id,model="bym",graph=newyork.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.month,model="iid")
+
+covid.ny.type1.inla <- inla(covid.ny.type1.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+
+
+```{r eval = FALSE}
+#Type 2
+covid.ny.type2.formula <- monthly.deaths ~ 1 + 
+  #structured spatial
+  f(num_id,model="bym",graph=newyork.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.int,model="iid",
+    #iid on the spatial component
+    group = month.int,
+    #rw2 structure on the temporal component
+    control.group = list(model="rw2"))
+
+
+covid.ny.type2.inla <- inla(covid.ny.type2.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+```{r eval = FALSE}
+#Type 3
+covid.ny.type3.formula <- monthly.deaths ~ 1 + 
+  #structured spatial
+  f(num_id,model="bym",graph=newyork.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(month.int,model="iid",
+    #iid on the temporal component
+    group = num_id.int,
+    #rw2 structure on the spatial component
+    control.group = list(model="besag"), graph = newyork.adj)
+
+
+covid.ny.type3.inla <- inla(covid.ny.type3.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+```{r}
+#Type 4
+covid.ny.type4.formula <- monthly.deaths ~ 1 + 
+  #structured spatial
+  f(num_id,model="bym",graph=newyork.adj) +
+  #structured time
+  f(Month.num,model="rw2") +
+  #iid time
+  f(Month.num1, model="iid") +
+  #interaction
+  f(num_id.int,model="besag",graph = newyork.adj,
+    group = month.int,
+    control.group = list(model="rw2"))
+
+
+covid.ny.type4.inla <- inla(covid.ny.type4.formula,
+                      family="nbinomial",
+                      data=covid.dat.ny,
+                      offset=log(TOT_POP),
+                      control.compute = list(cpo=TRUE, waic=TRUE),
+                      control.predictor=list(compute=TRUE))
+```
+
+```{r eval = FALSE}
+covid.ny.rw2.inla$waic$waic
+covid.ny.type1.inla$waic$waic
+covid.ny.type2.inla$waic$waic
+covid.ny.type4.inla$waic$waic
+```
+
+Though the Type4 spatio-temporal model exhibits the best fitting performance with the smallest WAIC value, in general, the impact of the interaction term remained consistent and moderate. Except for a few counties at specific time points, the effect of the interaction term in other regions exhibited minimal variation throughout the observation period. When examining the fitted value maps, it becomes apparent that most of the central region consistently reported relatively low death counts, maintaining a stable level over time. Conversely, the area surrounding New York City continued to grapple with the epidemic's spread in New York, witnessing a continual surge in the number of deaths over time. Nevertheless, the impact remained localized, primarily affecting the southeastern corner of the state. This may be because the population distribution of New York State is concentrated, resulting in less significant changes in spatio-temporal interaction terms between different regions.
+
+
+```{r warning=FALSE}
+#function to plot the interaction plots
+int.evo.plot <- function(covid.dat.al, covid.al.type.inla.mean) {
+  
+  #create the data
+  delta.int <- data.frame(delta=covid.al.type.inla.mean,
+                          num_id=rep(unique(covid.dat.al$num_id), each=20),
+                          Month.num=rep(unique(covid.dat.al$Month.num), times=62))
+  
+  delta.int <- left_join(covid.dat.al,delta.int)
+  
+  #only plot 
+  target <- c(1,4,8,12,15,18)
+  delta.int <- subset(delta.int, Month.num %in% target)
+  
+  ggplot(delta.int, aes(fill=delta, geometry=geometry)) +
+    geom_sf() +
+    theme_void () +
+    theme(legend.title = element_blank()) +
+    facet_wrap(~ Month.num)
+
+}
+```
+
+
+
+```{r warning=FALSE}
+#plot the interaction term of Type4
+q4_ny <- int.evo.plot(covid.dat.al=covid.dat.ny,
+                   covid.al.type.inla.mean=covid.ny.type4.inla$summary.random$num_id.int$mean)
+
+q4_ny
+
+#save the plot
+#ggsave("plot/interaction_type4_ny.png", q4_ny)
+```
+
+
+
+
+```{r}
+#plot for fitted values
+covid.dat.ny$type4.fit <- covid.ny.type4.inla$summary.fitted.values$mean
+```
+
+
+```{r}
+target <- c(1,4,8,12,15,18)
+covid.ny.fitted <- filter(covid.dat.ny, Month.num %in% target) %>%
+  group_by(num_id, Month.num) %>%
+  summarise_at(c("type4.fit"), sum)
+
+ggplot(covid.ny.fitted, aes(fill=type4.fit,geometry=geometry)) +
+  geom_sf() +
+  scale_fill_viridis(option = "cividis") +
+  theme_void() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(~Month.num)
+```
+
+Although the three demographic characteristics are insufficient to explain the number of deaths in New York State, there are other factors that need to be taken into account.  For instance, the age structure of the population in the region may play a significant role, given that older individuals generally face a higher risk of mortality from Covid-19. Moreover, although the Type4 model exhibits the highest fit with the highest WAIC value in this case, the discrepancy in WAIC between the Type4 and Type2 models is not substantial. Thus, there exists a trade-off between model complexity and interpretability. Further research is required to ascertain if interaction terms are essential and if they can be selectively integrated into specific regions, such as the southeast corner of New York State instead of the whole state.
+
+
+<br><br>
+
+
+### 7. Summary
+
+In summary, the factors affecting the death counts differed between Alabama and New York state, and distinct spatio-temporal patterns were observed in each state. In Alabama, there was a discernible structural feature in the spatio-temporal interaction term and space, with the epidemic progressively spreading over time from Jefferson County to neighboring areas. In New York State, deaths were primarily concentrated in the metropolitan area, displaying pronounced geographic characteristics and showing less susceptibility to other demographic factors. 
+
+
+
+
+
+
+
+
+
+
+
+
+## Appendix: 
+
+```{r ref.label=knitr::all_labels(), echo=FALSE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before)
+```
+
